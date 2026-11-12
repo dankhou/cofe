@@ -1,0 +1,1700 @@
+Option Explicit
+
+'==============================================================================
+'  770 INVENTORY TOOLS
+'
+'  Buttons (created by Inv_Setup, top-right of the sheet):
+'    + ADD ITEM   - jumps to the next blank row, ready for a barcode scan,
+'                   then walks you through Description > Shelf > Bin
+'    FIND         - scan/type a part # (partial text OK, also searches descriptions)
+'    PULL / USE   - scan a part, take qty out of stock (logged)
+'    RECEIVE      - scan a part, add qty to stock, reduces On Order (logged)
+'    MERGE DUPES  - combines rows that share the same part number (backup first)
+'    SORT         - by location (Shelf > Bin > Part #) or by Part #
+'    LOW STOCK    - report of items that are out or at/below MIN STOCK
+'    SHOW ALL     - un-hides rows after a FIND
+'
+'  ONE-TIME SETUP: paste the sheet code into the "770 Inventory" sheet
+'  module, then run Inv_Setup (Alt+F8). If anything acts stuck, run Inv_Reset.
+'==============================================================================
+
+'------------------------------- SETTINGS -------------------------------------
+Private Const SHEET_NAME As String = "770 Inventory"
+Private Const HEADER_ROW As Long = 5          ' first row of the column titles (titles may span rows 5-6)
+Private Const FIRST_DATA_ROW As Long = 7      ' first row that holds parts
+Private Const MAX_ROW As Long = 5000          ' dropdowns / highlighting cover rows down to here
+Private Const LISTS_SHEET As String = "Lists"
+Private Const LOG_SHEET As String = "Inventory Log"
+Private Const REPORT_SHEET As String = "Low Stock"
+Private Const APP_TITLE As String = "770 Inventory"
+Private Const MAIN_FONT_SIZE As Double = 10   ' description main line
+Private Const SUB_FONT_SIZE As Double = 8     ' description sub line
+Private Const BTN_PREFIX As String = "btnInv_"
+Private Const BTN_ANCHOR_COL As String = "M"  ' buttons start at this column, rows 1-2
+Private Const CUSTOM_ITEM As String = "CUSTOM (TYPE YOUR OWN ENTRY)"
+Private Const HOLD_TEXT As String = "HOLD - DO NOT USE"
+
+'------------------------------- STATE ----------------------------------------
+Private cScan As Long, cPart As Long, cDesc As Long, cShelf As Long, cBin As Long
+Private cOnHand As Long, cMin As Long, cCond As Long, cOnOrder As Long, cOrderNo As Long
+Private cProgram As Long, cCharge As Long, cLastPurch As Long, cTNum As Long
+Private cBarPrint As Long, cSku As Long, cMfg As Long, cLastCol As Long
+
+Private gPendingRow As Long
+Private gPrevDescAddr As String
+Private gPrevDescVal As String
+Private gBusy As Boolean
+Private gAutoCompleteWas As Boolean
+Private gACStored As Boolean
+
+
+'==============================================================================
+'                                BUTTON MACROS
+'==============================================================================
+
+Public Sub Inv_AddItem()
+    Dim ws As Worksheet
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    On Error GoTo Fail
+    Application.EnableEvents = False
+    StartNewItem ws
+Done:
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_Find()
+    Dim ws As Worksheet, txt As String, k As String, cancelled As Boolean
+    Dim r As Long, lastR As Long, i As Long, nHit As Long
+    Dim vP As Variant, vD As Variant, hits() As Long
+
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    txt = AskText("Scan or type a PART NUMBER." & vbLf & vbLf & _
+                  "Partial text works too (e.g. TV06 or CONNECTOR) - it searches " & _
+                  "part numbers and descriptions.", "Find Item", "", cancelled)
+    If cancelled Or txt = "" Then Exit Sub
+
+    On Error GoTo Fail
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    ShowAllRows ws
+
+    r = FindPartRow(ws, txt, 0)
+    If r > 0 Then
+        Application.ScreenUpdating = True
+        SelectRow ws, r, cPart
+        GoTo Done
+    End If
+
+    k = NormKey(txt)
+    lastR = LastDataRow(ws)
+    If lastR >= FIRST_DATA_ROW Then
+        vP = ColValues(ws, cPart, lastR)
+        vD = ColValues(ws, cDesc, lastR)
+        ReDim hits(1 To UBound(vP, 1))
+        For i = 1 To UBound(vP, 1)
+            If InStr(1, NormKey(vP(i, 1)), k, vbBinaryCompare) > 0 Or _
+               InStr(1, UCase$(CellText(vD(i, 1))), k, vbBinaryCompare) > 0 Then
+                nHit = nHit + 1
+                hits(nHit) = i + FIRST_DATA_ROW - 1
+            End If
+        Next i
+    End If
+
+    If nHit = 0 Then
+        Application.ScreenUpdating = True
+        MsgBox "Nothing found matching """ & txt & """.", vbInformation, APP_TITLE
+    ElseIf nHit = 1 Then
+        Application.ScreenUpdating = True
+        SelectRow ws, hits(1), cPart
+    Else
+        ws.Rows(FIRST_DATA_ROW & ":" & lastR).Hidden = True
+        For i = 1 To nHit
+            ws.Rows(hits(i)).Hidden = False
+        Next i
+        Application.ScreenUpdating = True
+        SelectRow ws, hits(1), cPart
+        MsgBox nHit & " matches for """ & txt & """ are shown." & vbLf & _
+               "Click SHOW ALL to see the full list again.", vbInformation, APP_TITLE
+    End If
+Done:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_ShowAll()
+    Dim ws As Worksheet
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    ShowAllRows ws
+    Application.StatusBar = False
+End Sub
+
+Public Sub Inv_Pull()
+    Dim ws As Worksheet, txt As String, cancelled As Boolean, r As Long
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    On Error GoTo Fail
+    Application.EnableEvents = False
+    ShowAllRows ws
+    Do
+        txt = AskText("Scan or type the PART NUMBER to PULL from stock." & vbLf & vbLf & _
+                      "(Click Cancel when you're finished.)", "Pull / Use Item", "", cancelled)
+        If cancelled Then Exit Do
+        If txt <> "" Then
+            r = FindPartRow(ws, txt, 0)
+            If r = 0 Then
+                MsgBox "Part """ & txt & """ is not in the inventory.", vbExclamation, APP_TITLE
+            Else
+                DoPull ws, r
+            End If
+        End If
+    Loop
+Done:
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_Receive()
+    Dim ws As Worksheet, txt As String, cancelled As Boolean, r As Long
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    On Error GoTo Fail
+    Application.EnableEvents = False
+    ShowAllRows ws
+    Do
+        txt = AskText("Scan or type the PART NUMBER being RECEIVED." & vbLf & vbLf & _
+                      "(Click Cancel when you're finished.)", "Receive Item", "", cancelled)
+        If cancelled Then Exit Do
+        If txt <> "" Then
+            r = FindPartRow(ws, txt, 0)
+            If r = 0 Then
+                If MsgBox("Part """ & txt & """ is not in the inventory yet." & vbLf & vbLf & _
+                          "Add it as a NEW item?", vbYesNo + vbQuestion, APP_TITLE) = vbYes Then
+                    StartNewItem ws
+                    If gPendingRow > 0 Then
+                        ws.Cells(gPendingRow, cPart).Value = txt
+                        OnPartEntered ws, ws.Cells(gPendingRow, cPart)
+                    End If
+                    Exit Do
+                End If
+            Else
+                DoReceive ws, r
+            End If
+        End If
+    Loop
+Done:
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_MergeDuplicates()
+    Dim ws As Worksheet, lastR As Long, data As Variant, n As Long, i As Long, j As Long
+    Dim firstIdx As Object, grp As Object, k As String, dupCount As Long
+    Dim delRng As Range, bk As String, conflicts As String, addOH As Double, logNote As String
+
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    On Error GoTo Fail
+    Application.EnableEvents = False
+    ShowAllRows ws
+
+    lastR = LastDataRow(ws)
+    If lastR <= FIRST_DATA_ROW Then
+        MsgBox "No duplicate part numbers found.", vbInformation, APP_TITLE
+        GoTo Done
+    End If
+
+    data = ws.Range(ws.Cells(FIRST_DATA_ROW, 1), ws.Cells(lastR, cLastCol)).Value
+    n = UBound(data, 1)
+    Set firstIdx = CreateObject("Scripting.Dictionary")
+    Set grp = CreateObject("Scripting.Dictionary")
+    For i = 1 To n
+        k = NormKey(data(i, cPart))
+        If k <> "" Then
+            If firstIdx.Exists(k) Then
+                dupCount = dupCount + 1
+                grp(k) = True
+            Else
+                firstIdx.Add k, i
+            End If
+        End If
+    Next i
+
+    If dupCount = 0 Then
+        MsgBox "No duplicate part numbers found - nothing to merge.", vbInformation, APP_TITLE
+        GoTo Done
+    End If
+
+    If MsgBox("Found " & dupCount & " duplicate row(s) covering " & grp.Count & " part number(s)." & vbLf & vbLf & _
+              "Each part will be combined into its FIRST row:" & vbLf & _
+              "  - ON HAND and ON ORDER quantities are added together" & vbLf & _
+              "  - Blank fields are filled in from the duplicate rows" & vbLf & _
+              "  - Different shelves/bins/programs are kept, joined with "" / """ & vbLf & _
+              "  - The extra rows are deleted" & vbLf & vbLf & _
+              "A backup copy of the sheet is made first. Continue?", _
+              vbYesNo + vbQuestion, "Merge Duplicates") = vbNo Then GoTo Done
+
+    Application.ScreenUpdating = False
+    bk = MakeBackup(ws)
+
+    For i = 1 To n
+        k = NormKey(data(i, cPart))
+        If k <> "" Then
+            j = firstIdx(k)
+            If j <> i Then
+                conflicts = ""
+                addOH = NumVal(data(i, cOnHand))
+                MergeRowInto ws, data, j, i, conflicts
+                logNote = "Row " & (i + FIRST_DATA_ROW - 1) & " merged into row " & (j + FIRST_DATA_ROW - 1) & _
+                          " (row numbers before merge)"
+                If conflicts <> "" Then logNote = logNote & " | CHECK: " & conflicts
+                WriteLog "MERGE", CellText(data(j, cPart)), addOH, NumVal(data(j, cOnHand)), logNote
+                If delRng Is Nothing Then
+                    Set delRng = ws.Rows(i + FIRST_DATA_ROW - 1)
+                Else
+                    Set delRng = Union(delRng, ws.Rows(i + FIRST_DATA_ROW - 1))
+                End If
+            End If
+        End If
+    Next i
+
+    If Not delRng Is Nothing Then delRng.Delete Shift:=xlUp
+    gPendingRow = 0
+    Application.ScreenUpdating = True
+    ws.Activate
+    MsgBox "Done. Combined " & dupCount & " duplicate row(s) into " & grp.Count & " part(s)." & vbLf & vbLf & _
+           "Backup sheet: " & bk & vbLf & _
+           "Details (including parts stored in more than one location) are on the '" & _
+           LOG_SHEET & "' sheet.", vbInformation, APP_TITLE
+Done:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_Sort()
+    Dim ws As Worksheet, ans As VbMsgBoxResult, lastR As Long, rng As Range
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    ans = MsgBox("How do you want to sort?" & vbLf & vbLf & _
+                 "YES  =  by Location (Shelf, then Bin, then Part #)" & vbLf & _
+                 "NO   =  by Part Number" & vbLf & _
+                 "CANCEL = don't sort", vbYesNoCancel + vbQuestion, APP_TITLE)
+    If ans = vbCancel Then Exit Sub
+
+    On Error GoTo Fail
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    ShowAllRows ws
+    lastR = LastDataRow(ws)
+    If lastR <= FIRST_DATA_ROW Then GoTo Done
+
+    Set rng = ws.Range(ws.Cells(FIRST_DATA_ROW, 1), ws.Cells(lastR, cLastCol))
+    With ws.Sort
+        .SortFields.Clear
+        If ans = vbYes Then
+            .SortFields.Add Key:=rng.Columns(cShelf), Order:=xlAscending, DataOption:=xlSortNormal
+            If cBin > 0 Then .SortFields.Add Key:=rng.Columns(cBin), Order:=xlAscending, DataOption:=xlSortTextAsNumbers
+        End If
+        .SortFields.Add Key:=rng.Columns(cPart), Order:=xlAscending, DataOption:=xlSortNormal
+        .SetRange rng
+        .Header = xlNo
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .Apply
+    End With
+    gPendingRow = 0
+Done:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_LowStockReport()
+    Dim ws As Worksheet, rp As Worksheet, lastR As Long, i As Long, pass As Long, outR As Long
+    Dim vP As Variant, vD As Variant, vS As Variant, vB As Variant, vOH As Variant
+    Dim vMin As Variant, vOO As Variant, vPr As Variant, vC As Variant
+    Dim oh As Double, mn As Double, oo As Double, status As String, want As String
+    Dim cnt(1 To 3) As Long
+
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    On Error GoTo Fail
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    lastR = LastDataRow(ws)
+    If lastR < FIRST_DATA_ROW Then
+        MsgBox "There are no items yet.", vbInformation, APP_TITLE
+        GoTo Done
+    End If
+    vP = ColValues(ws, cPart, lastR)
+    vD = ColValues(ws, cDesc, lastR)
+    vS = ColValues(ws, cShelf, lastR)
+    vOH = ColValues(ws, cOnHand, lastR)
+    vB = ColValuesOpt(ws, cBin, lastR)
+    vMin = ColValuesOpt(ws, cMin, lastR)
+    vOO = ColValuesOpt(ws, cOnOrder, lastR)
+    vPr = ColValuesOpt(ws, cProgram, lastR)
+    vC = ColValuesOpt(ws, cCond, lastR)
+
+    Set rp = GetOrCreateSheet(REPORT_SHEET)
+    If rp.AutoFilterMode Then rp.AutoFilterMode = False
+    rp.Cells.Clear
+    rp.Range("A1").Value = "LOW STOCK REPORT  -  " & Format$(Now, "mm/dd/yyyy h:mm AM/PM")
+    rp.Range("A1").Font.Bold = True
+    rp.Range("A1").Font.Size = 14
+    rp.Range("A3:K3").Value = Array("STATUS", "PART NUMBER", "DESCRIPTION", "SHELF", "BIN", "ON HAND", _
+                                    "MIN STOCK", "ON ORDER", "SUGGESTED ORDER", "PROGRAM USED", "GO TO")
+    With rp.Range("A3:K3")
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .Interior.Color = RGB(31, 56, 100)
+        .WrapText = True
+        .VerticalAlignment = xlCenter
+    End With
+
+    outR = 3
+    For pass = 1 To 3
+        want = Choose(pass, "OUT", "LOW", "HOLD")
+        For i = 1 To UBound(vP, 1)
+            If NormKey(vP(i, 1)) <> "" Then
+                oh = NumVal(vOH(i, 1))
+                mn = NumVal(ArrVal(vMin, i))
+                oo = NumVal(ArrVal(vOO, i))
+                status = ""
+                If InStr(1, UCase$(CellText(ArrVal(vC, i))), "HOLD") > 0 Then
+                    If oh <= 0 Or (mn > 0 And oh <= mn) Then status = "HOLD"
+                ElseIf oh <= 0 Then
+                    status = "OUT"
+                ElseIf mn > 0 And oh <= mn Then
+                    status = "LOW"
+                End If
+                If status = want Then
+                    outR = outR + 1
+                    cnt(pass) = cnt(pass) + 1
+                    rp.Cells(outR, 1).Value = status
+                    rp.Cells(outR, 2).NumberFormat = "@"
+                    rp.Cells(outR, 2).Value = CellText(vP(i, 1))
+                    rp.Cells(outR, 3).Value = Replace(CellText(vD(i, 1)), vbLf, " - ")
+                    rp.Cells(outR, 4).Value = CellText(vS(i, 1))
+                    rp.Cells(outR, 5).Value = ArrVal(vB, i)
+                    rp.Cells(outR, 6).Value = oh
+                    rp.Cells(outR, 7).Value = mn
+                    rp.Cells(outR, 8).Value = oo
+                    If mn > 0 And (mn - oh - oo) > 0 Then rp.Cells(outR, 9).Value = mn - oh - oo
+                    rp.Cells(outR, 10).Value = CellText(ArrVal(vPr, i))
+                    rp.Cells(outR, 11).Formula = "=HYPERLINK(""#'" & SHEET_NAME & "'!" & ColL(cPart) & _
+                        (i + FIRST_DATA_ROW - 1) & """,""Row " & (i + FIRST_DATA_ROW - 1) & """)"
+                    With rp.Cells(outR, 1)
+                        .Font.Bold = True
+                        .Font.Color = RGB(255, 255, 255)
+                        Select Case status
+                            Case "OUT": .Interior.Color = RGB(255, 0, 0)
+                            Case "LOW": .Interior.Color = RGB(255, 192, 0): .Font.Color = RGB(0, 0, 0)
+                            Case "HOLD": .Interior.Color = RGB(197, 90, 17)
+                        End Select
+                    End With
+                End If
+            End If
+        Next i
+    Next pass
+
+    rp.Range("A2").Value = "OUT of stock: " & cnt(1) & "     LOW (at/below MIN): " & cnt(2) & _
+                           "     On HOLD and low: " & cnt(3) & _
+                           "     Suggested order = MIN - on hand - on order"
+    rp.Range("A2").Font.Italic = True
+    rp.Columns("A").ColumnWidth = 8
+    rp.Columns("B").ColumnWidth = 22
+    rp.Columns("C").ColumnWidth = 45
+    rp.Columns("D").ColumnWidth = 18
+    rp.Columns("E:I").ColumnWidth = 10
+    rp.Columns("J").ColumnWidth = 22
+    rp.Columns("K").ColumnWidth = 10
+    rp.Range("A3:K" & outR).Borders.LineStyle = xlContinuous
+    If rp.AutoFilterMode Then rp.AutoFilterMode = False
+    If outR > 3 Then rp.Range("A3:K" & outR).AutoFilter
+    rp.Tab.Color = RGB(237, 125, 49)
+
+    Application.ScreenUpdating = True
+    rp.Activate
+    ActiveWindow.FreezePanes = False
+    ActiveWindow.ScrollRow = 1
+    ActiveWindow.SplitColumn = 0
+    ActiveWindow.SplitRow = 3
+    ActiveWindow.FreezePanes = True
+    If outR = 3 Then MsgBox "Nothing is out of stock or at/below MIN STOCK.", vbInformation, APP_TITLE
+Done:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+'--- Run once after pasting (Alt+F8 > Inv_Setup). Safe to run again. ---
+Public Sub Inv_Setup()
+    Dim ws As Worksheet, prevAddr As String
+    Set ws = GetInv(): If ws Is Nothing Then Exit Sub
+    On Error GoTo Fail
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    ws.Activate
+    On Error Resume Next
+    prevAddr = ActiveCell.Address
+    On Error GoTo Fail
+
+    BuildLists
+    ApplyDropdowns ws
+    ApplyHighlighting ws
+    GetLogSheet
+    BuildButtons ws
+
+    ws.Activate
+    If prevAddr <> "" Then ws.Range(prevAddr).Select
+    Application.ScreenUpdating = True
+
+    MigrateHoldFills ws
+
+    If MsgBox("Remove the old hand-colored fills from the ON HAND column?" & vbLf & vbLf & _
+              "(Red / amber is now applied automatically when stock is out or at/below MIN, " & _
+              "so the old manual colors aren't needed. Choose No to keep them.)", _
+              vbYesNo + vbQuestion, APP_TITLE) = vbYes Then
+        ws.Range(ws.Cells(FIRST_DATA_ROW, cOnHand), _
+                 ws.Cells(MaxL(FIRST_DATA_ROW, LastDataRow(ws)), cOnHand)).Interior.Pattern = xlNone
+    End If
+
+    MsgBox "Inventory tools are set up!" & vbLf & vbLf & _
+           "- Buttons are at the top right of the sheet." & vbLf & _
+           "- Dropdown options live on the '" & LISTS_SHEET & "' sheet - edit them there." & vbLf & _
+           "- Adds / pulls / receives / merges are recorded on the '" & LOG_SHEET & "' sheet." & vbLf & vbLf & _
+           "Save the workbook as .xlsm to keep the macros.", vbInformation, APP_TITLE
+Done:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+'--- If anything ever seems stuck (dropdown flow not reacting), run this. ---
+Public Sub Inv_Reset()
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Application.StatusBar = False
+    RestoreAutoComplete
+    gBusy = False
+    gPendingRow = 0
+End Sub
+
+
+'==============================================================================
+'               SHEET EVENTS (called from the 770 Inventory sheet module)
+'==============================================================================
+
+Public Sub Inv_OnChange(ByVal Target As Range)
+    Dim ws As Worksheet, hit As Range, c As Range
+    If gBusy Then Exit Sub
+    Set ws = Target.Worksheet
+    If ws.Name <> SHEET_NAME Then Exit Sub
+    If Target.Row + Target.Rows.Count - 1 < FIRST_DATA_ROW Then Exit Sub
+    If Not LoadCols(ws) Then Exit Sub
+
+    gBusy = True
+    Application.EnableEvents = False
+    On Error GoTo Fail
+
+    If Target.CountLarge = 1 Then
+        If Target.Row >= FIRST_DATA_ROW And Target.Row <= MAX_ROW Then
+            Select Case Target.Column
+                Case cPart
+                    OnPartEntered ws, Target
+                Case cDesc
+                    OnDescEntered ws, Target
+                Case cShelf
+                    If Len(CellText(Target.Value)) > 0 Then
+                        If CellText(Target.Value) <> UCase$(Trim$(CellText(Target.Value))) Then
+                            Target.Value = UCase$(Trim$(CellText(Target.Value)))
+                        End If
+                        If Target.Row = gPendingRow Then
+                            If cBin > 0 Then
+                                Application.StatusBar = "ADD ITEM: type the BIN number and press Enter."
+                                SelectCell ws, ws.Cells(Target.Row, cBin)
+                            Else
+                                FinishPending ws, Target.Row
+                            End If
+                        End If
+                    End If
+                Case cBin
+                    If Target.Row = gPendingRow And Len(CellText(Target.Value)) > 0 Then FinishPending ws, Target.Row
+            End Select
+        End If
+    Else
+        Set hit = Intersect(Target, ws.Range(ws.Cells(FIRST_DATA_ROW, cDesc), ws.Cells(MAX_ROW, cDesc)))
+        If Not hit Is Nothing Then
+            If hit.CountLarge <= 2000 Then
+                For Each c In hit.Cells
+                    FormatDescCell c
+                Next c
+            End If
+        End If
+    End If
+Done:
+    Application.EnableEvents = True
+    gBusy = False
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+Public Sub Inv_OnSelect(ByVal Target As Range)
+    If gBusy Then Exit Sub
+    If Target.Worksheet.Name <> SHEET_NAME Then Exit Sub
+    If Target.CountLarge <> 1 Then Exit Sub
+    If cDesc = 0 Then
+        If Not LoadCols(Target.Worksheet) Then Exit Sub
+    End If
+    If Target.Column = cDesc Then
+        gPrevDescAddr = Target.Address
+        gPrevDescVal = CellText(Target.Value)
+    End If
+End Sub
+
+Public Sub Inv_OnDoubleClick(ByVal Target As Range, ByRef Cancel As Boolean)
+    Dim v As String, subTxt As String, cancelled As Boolean
+    If Target.Worksheet.Name <> SHEET_NAME Then Exit Sub
+    If Target.CountLarge <> 1 Or Target.Row < FIRST_DATA_ROW Then Exit Sub
+    If Not LoadCols(Target.Worksheet) Then Exit Sub
+    If Target.Column <> cDesc Then Exit Sub
+    v = CellText(Target.Value)
+    If Trim$(v) = "" Then Exit Sub
+
+    Cancel = True
+    subTxt = AskText("SUB-DESCRIPTION for " & MainPart(v) & ":" & vbLf & vbLf & _
+                     "(Clear the box and click OK to remove it.)", "Edit Sub Description", SubPart(v), cancelled)
+    If cancelled Then Exit Sub
+
+    On Error GoTo Fail
+    gBusy = True
+    Application.EnableEvents = False
+    WriteDescription Target, MainPart(v), subTxt
+Done:
+    Application.EnableEvents = True
+    gBusy = False
+    Exit Sub
+Fail:
+    ShowErr
+    Resume Done
+End Sub
+
+
+'==============================================================================
+'                               ADD ITEM FLOW
+'==============================================================================
+
+Private Sub StartNewItem(ws As Worksheet)
+    Dim r As Long
+    gPendingRow = 0
+    ShowAllRows ws
+    r = LastDataRow(ws) + 1
+    If r > MAX_ROW Then
+        MsgBox "The list has reached row " & MAX_ROW & "." & vbLf & _
+               "Increase MAX_ROW at the top of the module and run Inv_Setup again.", _
+               vbExclamation, APP_TITLE
+        Exit Sub
+    End If
+
+    PrepareNewRow ws, r
+    gPendingRow = r
+
+    ' Excel AutoComplete can "finish" a scanned part # into a longer existing one - turn it off while scanning
+    If Not gACStored Then
+        gAutoCompleteWas = Application.EnableAutoComplete
+        gACStored = True
+    End If
+    Application.EnableAutoComplete = False
+
+    ws.Activate
+    ws.Cells(r, cPart).Select
+    EnsureVisible ws.Cells(r, cPart)
+    Application.StatusBar = "ADD ITEM: scan (or type) the PART NUMBER into row " & r & " and press Enter."
+End Sub
+
+Private Sub OnPartEntered(ws As Worksheet, ByVal c As Range)
+    Dim part As String, r As Long, exRow As Long, isNew As Boolean
+    Dim qty As Double, newQty As Double
+
+    RestoreAutoComplete
+    r = c.Row
+    part = CleanScan(CellText(c.Value))
+    If part = "" Then Exit Sub
+    If CellText(c.Value) <> part Then c.Value = part
+
+    isNew = (r = gPendingRow) Or RowEmptyExcept(ws, r, cPart)
+    exRow = FindPartRow(ws, part, r)
+
+    If exRow > 0 Then
+        If isNew Then
+            qty = AskQty("Part " & part & " is ALREADY in the inventory:" & vbLf & vbLf & _
+                         "   Row " & exRow & "   |   " & LocText(ws, exRow) & "   |   On hand: " & _
+                         NumVal(ws.Cells(exRow, cOnHand).Value) & vbLf & vbLf & _
+                         "Quantity to ADD to that entry?  (Cancel = add nothing)", "Duplicate Part - Combine", 1)
+            ClearRowConstants ws, r
+            gPendingRow = 0
+            Application.StatusBar = False
+            If qty > 0 Then
+                newQty = NumVal(ws.Cells(exRow, cOnHand).Value) + qty
+                ws.Cells(exRow, cOnHand).Value = newQty
+                WriteLog "ADD QTY", part, qty, newQty, "Scanned as a new item - combined into existing row " & exRow
+            End If
+            SelectRow ws, exRow, cOnHand
+            If qty > 0 Then
+                MsgBox "Combined: " & part & " now has " & newQty & " on hand (row " & exRow & ").", _
+                       vbInformation, APP_TITLE
+            End If
+        Else
+            MsgBox "Heads up: " & part & " is also listed in row " & exRow & "." & vbLf & _
+                   "Use MERGE DUPES to combine them.", vbExclamation, APP_TITLE
+        End If
+        Exit Sub
+    End If
+
+    If isNew Then
+        qty = AskQty("NEW part:  " & part & vbLf & vbLf & "Quantity on hand?", "Add Item", 1)
+        If qty < 0 Then
+            ClearRowConstants ws, r
+            gPendingRow = 0
+            Application.StatusBar = False
+            ws.Cells(r, cPart).Select
+            Exit Sub
+        End If
+        ws.Cells(r, cOnHand).Value = qty
+        SetIfBlank ws, r, cMin, 0
+        SetIfBlank ws, r, cOnOrder, 0
+        SetIfBlank ws, r, cOrderNo, 0
+        WriteLog "ADD NEW", part, qty, qty, "Row " & r
+        gPendingRow = r
+        Application.StatusBar = "ADD ITEM: pick a DESCRIPTION from the dropdown (Alt + Down Arrow opens it)."
+        SelectCell ws, ws.Cells(r, cDesc)
+    End If
+End Sub
+
+Private Sub OnDescEntered(ws As Worksheet, ByVal c As Range)
+    Dim v As String, mainTxt As String, subTxt As String, oldSub As String
+    Dim custom As String, cancelled As Boolean
+
+    v = CellText(c.Value)
+    If Trim$(v) = "" Then
+        FormatDescCell c
+        Exit Sub
+    End If
+
+    If InStr(v, vbLf) > 0 Then
+        FormatDescCell c
+        GoTo Advance
+    End If
+
+    mainTxt = UCase$(Trim$(v))
+    If mainTxt = CUSTOM_ITEM Then
+        custom = UCase$(AskText("Type the DESCRIPTION for this part:", "Custom Description", "", cancelled))
+        If cancelled Or custom = "" Then
+            RestorePrevDesc c
+            Exit Sub
+        End If
+        mainTxt = custom
+        If MsgBox("Add """ & mainTxt & """ to the Description dropdown for next time?", _
+                  vbYesNo + vbQuestion, APP_TITLE) = vbYes Then AddToList 1, mainTxt
+    End If
+
+    If gPrevDescAddr = c.Address Then oldSub = SubPart(gPrevDescVal)
+    subTxt = AskText("SUB-DESCRIPTION for " & mainTxt & "  (optional - leave blank to skip)" & vbLf & vbLf & _
+                     "Example:  22 " & ChrW(181) & "F, 100 V, " & ChrW(177) & "20%, PC Pin, 2000 hours @ 85" & _
+                     ChrW(176) & "C, Polar", "Sub Description", oldSub, cancelled)
+    If cancelled Then subTxt = oldSub
+    WriteDescription c, mainTxt, subTxt
+
+Advance:
+    If c.Row = gPendingRow Then
+        Application.StatusBar = "ADD ITEM: pick a SHELF location from the dropdown."
+        SelectCell ws, ws.Cells(c.Row, cShelf)
+    End If
+End Sub
+
+Private Sub FinishPending(ws As Worksheet, ByVal r As Long)
+    gPendingRow = 0
+    Application.StatusBar = False
+    ws.Rows(r).AutoFit
+    If MsgBox("Added:  " & CellText(ws.Cells(r, cPart).Value) & "   (" & LocText(ws, r) & ")" & vbLf & vbLf & _
+              "Scan another NEW item?", vbYesNo + vbQuestion, APP_TITLE) = vbYes Then
+        StartNewItem ws
+    End If
+End Sub
+
+Private Sub PrepareNewRow(ws As Worksheet, ByVal r As Long)
+    Dim c As Long, src As Range, dst As Range, b As Variant
+    If r > FIRST_DATA_ROW Then
+        For c = 1 To cLastCol
+            Set src = ws.Cells(r - 1, c)
+            Set dst = ws.Cells(r, c)
+            dst.NumberFormat = src.NumberFormat
+            dst.HorizontalAlignment = src.HorizontalAlignment
+            dst.VerticalAlignment = src.VerticalAlignment
+            If Not IsNull(src.WrapText) Then dst.WrapText = src.WrapText
+            If Not IsNull(src.Font.Name) Then dst.Font.Name = src.Font.Name
+        Next c
+    End If
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, cLastCol))
+        .Interior.Pattern = xlNone
+        .Font.ColorIndex = xlColorIndexAutomatic
+        .Font.Bold = False
+        .Font.Italic = False
+        .Font.Size = MAIN_FONT_SIZE
+        For Each b In Array(xlEdgeLeft, xlEdgeTop, xlEdgeBottom, xlEdgeRight, xlInsideVertical)
+            With .Borders(b)
+                .LineStyle = xlContinuous
+                .Weight = xlThin
+            End With
+        Next b
+    End With
+    ws.Cells(r, cPart).NumberFormat = "@"
+End Sub
+
+
+'==============================================================================
+'                               PULL / RECEIVE
+'==============================================================================
+
+Private Sub DoPull(ws As Worksheet, ByVal r As Long)
+    Dim part As String, onHand As Double, qty As Double, newQty As Double, minQ As Double
+    Dim note As String, cancelled As Boolean
+
+    part = CellText(ws.Cells(r, cPart).Value)
+    onHand = NumVal(ws.Cells(r, cOnHand).Value)
+    SelectRow ws, r, cOnHand
+
+    If IsOnHold(ws, r) Then
+        If MsgBox("WARNING: " & part & " is marked " & HOLD_TEXT & "." & vbLf & vbLf & "Pull it anyway?", _
+                  vbYesNo + vbExclamation + vbDefaultButton2, APP_TITLE) = vbNo Then Exit Sub
+    End If
+    If onHand <= 0 Then
+        MsgBox part & " shows 0 on hand - nothing to pull.", vbExclamation, APP_TITLE
+        Exit Sub
+    End If
+
+    qty = AskQty(ItemSummary(ws, r) & vbLf & vbLf & "Quantity to PULL?", "Pull / Use Item", 1)
+    If qty <= 0 Then Exit Sub
+    If qty > onHand Then
+        If MsgBox("Only " & onHand & " on hand." & vbLf & "Pull all " & onHand & "?", _
+                  vbYesNo + vbQuestion, APP_TITLE) = vbNo Then Exit Sub
+        qty = onHand
+    End If
+    note = AskText("What is it for?  (program, charge #, or a note - optional)", "Pull / Use Item", "", cancelled)
+
+    newQty = onHand - qty
+    ws.Cells(r, cOnHand).Value = newQty
+    WriteLog "PULL", part, -qty, newQty, note
+
+    If cMin > 0 Then minQ = NumVal(ws.Cells(r, cMin).Value)
+    If newQty <= 0 Then
+        MsgBox part & " is now OUT OF STOCK.", vbExclamation, APP_TITLE
+    ElseIf minQ > 0 And newQty <= minQ Then
+        MsgBox part & " is now at/below MIN STOCK  (" & newQty & " on hand, min " & minQ & ").", _
+               vbInformation, APP_TITLE
+    End If
+End Sub
+
+Private Sub DoReceive(ws As Worksheet, ByVal r As Long)
+    Dim part As String, onHand As Double, qty As Double, newQty As Double
+    Dim onOrd As Double, newOrd As Double, note As String
+
+    part = CellText(ws.Cells(r, cPart).Value)
+    onHand = NumVal(ws.Cells(r, cOnHand).Value)
+    SelectRow ws, r, cOnHand
+
+    qty = AskQty(ItemSummary(ws, r) & vbLf & vbLf & "Quantity RECEIVED?", "Receive Item", 1)
+    If qty <= 0 Then Exit Sub
+
+    newQty = onHand + qty
+    ws.Cells(r, cOnHand).Value = newQty
+
+    If cOnOrder > 0 Then
+        onOrd = NumVal(ws.Cells(r, cOnOrder).Value)
+        If onOrd > 0 Then
+            newOrd = onOrd - qty
+            If newOrd < 0 Then newOrd = 0
+            ws.Cells(r, cOnOrder).Value = newOrd
+            note = "On Order " & onOrd & " -> " & newOrd
+            If cLastPurch > 0 Then
+                StampLastPurchased ws.Cells(r, cLastPurch)
+                note = note & "; Last Purchased updated"
+            End If
+        End If
+    End If
+    WriteLog "RECEIVE", part, qty, newQty, note
+End Sub
+
+Private Sub StampLastPurchased(ByVal c As Range)
+    Dim v As Variant, fmt As String
+    If c.HasFormula Then Exit Sub
+    v = c.Value
+    fmt = LCase$(c.NumberFormat)
+    If VarType(v) = vbDate Then
+        c.Value = Date
+    ElseIf IsEmpty(v) And (InStr(fmt, "d") > 0 Or InStr(fmt, "m") > 0) Then
+        c.Value = Date
+    Else
+        c.Value = Year(Date)
+    End If
+End Sub
+
+
+'==============================================================================
+'                                   MERGE
+'==============================================================================
+
+Private Sub MergeRowInto(ws As Worksheet, data As Variant, ByVal j As Long, ByVal i As Long, _
+                         ByRef conflicts As String)
+    Dim c As Long, a As Variant, b As Variant, newV As Variant, changed As Boolean
+    Dim rowJ As Long, sa As String, sb As String, okA As Boolean, okB As Boolean
+    Dim na As Double, nb As Double
+
+    rowJ = j + FIRST_DATA_ROW - 1
+    For c = 1 To cLastCol
+        If c <> cPart Then
+            a = data(j, c)
+            b = data(i, c)
+            changed = False
+            If Not IsError(a) And Not IsError(b) Then
+                sa = Trim$(CellText(a))
+                sb = Trim$(CellText(b))
+                If sb <> "" Then
+                    Select Case c
+                        Case cOnHand, cOnOrder
+                            If NumVal(b) <> 0 Then
+                                newV = NumVal(a) + NumVal(b)
+                                changed = True
+                            End If
+                        Case cMin
+                            If NumVal(b) > NumVal(a) Then
+                                newV = b
+                                changed = True
+                            End If
+                        Case cLastPurch
+                            If sa = "" Then
+                                newV = b
+                                changed = True
+                            Else
+                                na = ToNum(a, okA)
+                                nb = ToNum(b, okB)
+                                If okA And okB Then
+                                    If nb > na Then
+                                        newV = b
+                                        changed = True
+                                    End If
+                                ElseIf UCase$(sa) <> UCase$(sb) Then
+                                    newV = JoinDistinct(sa, sb)
+                                    changed = (CStr(newV) <> sa)
+                                End If
+                            End If
+                        Case cDesc
+                            If sa = "" Then
+                                newV = b
+                                changed = True
+                            ElseIf UCase$(MainPart(sa)) <> UCase$(MainPart(sb)) Then
+                                AddNote conflicts, "description also listed as " & MainPart(sb)
+                            End If
+                        Case cOrderNo
+                            If sb <> "0" Then
+                                If sa = "" Or sa = "0" Then
+                                    newV = b
+                                    changed = True
+                                ElseIf UCase$(sa) <> UCase$(sb) Then
+                                    newV = JoinDistinct(sa, sb)
+                                    changed = (CStr(newV) <> sa)
+                                End If
+                            End If
+                        Case Else
+                            If sa = "" Then
+                                newV = b
+                                changed = True
+                            ElseIf UCase$(sa) <> UCase$(sb) Then
+                                If IsNumeric(a) And IsNumeric(b) And Not IsTextCol(c) Then
+                                    AddNote conflicts, HeaderText(ws, c) & " " & sa & " vs " & sb
+                                Else
+                                    newV = JoinDistinct(sa, sb)
+                                    changed = (CStr(newV) <> sa)
+                                    If changed And (c = cShelf Or c = cBin) Then AddNote conflicts, "stored in more than one location"
+                                End If
+                            End If
+                    End Select
+                End If
+            End If
+
+            If changed Then
+                If Not ws.Cells(rowJ, c).HasFormula Then
+                    ws.Cells(rowJ, c).Value = newV
+                    data(j, c) = newV
+                    If c = cDesc Then FormatDescCell ws.Cells(rowJ, c)
+                End If
+            End If
+        End If
+    Next c
+End Sub
+
+Private Function MakeBackup(ws As Worksheet) As String
+    Dim wb As Workbook, bk As Worksheet, nm As String, i As Long
+    Set wb = ws.Parent
+    Application.DisplayAlerts = False
+    ws.Copy After:=wb.Sheets(wb.Sheets.Count)
+    Application.DisplayAlerts = True
+    Set bk = wb.Sheets(wb.Sheets.Count)
+
+    nm = "Backup " & Format$(Now, "yyyy-mm-dd hhmm")
+    i = 1
+    Do While Not SheetByName(nm) Is Nothing
+        i = i + 1
+        nm = "Backup " & Format$(Now, "yyyy-mm-dd hhmm") & " (" & i & ")"
+    Loop
+    bk.Name = Left$(nm, 31)
+    bk.Tab.Color = RGB(128, 128, 128)
+
+    For i = bk.Shapes.Count To 1 Step -1
+        If bk.Shapes(i).Name Like BTN_PREFIX & "*" Then bk.Shapes(i).Delete
+    Next i
+    ws.Activate
+    MakeBackup = bk.Name
+End Function
+
+
+'==============================================================================
+'                                   SETUP
+'==============================================================================
+
+Private Sub BuildLists()
+    Dim ls As Worksheet
+    Set ls = SheetByName(LISTS_SHEET)
+    If ls Is Nothing Then
+        Set ls = GetOrCreateSheet(LISTS_SHEET)
+        ls.Range("A1:C1").Value = Array("DESCRIPTION OPTIONS", "SHELF OPTIONS", "CONDITION OPTIONS")
+        FillCol ls, 1, Array("BACKSHELL", "CONNECTOR", "CIRCUIT BREAKER", "RESISTORS", "POWER PACK", _
+                             "PINS", "WIRES", "TERMINAL LUGS", "HARDWARE", "FUSES", "DIODE", "CABLES", _
+                             "MISC", "ENCLOSURE", "TEST EQUIPMENT", "TOOLS", "TEST SETUP", "PXI CARDS", _
+                             "PCI CARDS", "VXI CARDS", "ELECTRONIC PARTS", "MISC BOARDS", _
+                             "POWER SUPPLIES", "ITA'S", CUSTOM_ITEM)
+        FillCol ls, 2, Array("CAGE 2RT", "1ST FLR CLOSET", "DITMCO CABINET", "CAGE 2 MAIN", "PHONE CLOSET")
+        FillCol ls, 3, Array("NEW", "USED - GOOD", "REFURBISHED", "NEEDS REPAIR", "DEFECTIVE", HOLD_TEXT)
+        With ls.Range("A1:C1")
+            .Font.Bold = True
+            .Font.Color = RGB(255, 255, 255)
+            .Interior.Color = RGB(31, 56, 100)
+        End With
+        ls.Columns("A:C").ColumnWidth = 32
+        ls.Range("E1").Value = "Edit these lists to change the dropdowns on the inventory sheet."
+        ls.Range("E2").Value = "Keep '" & CUSTOM_ITEM & "' as the LAST description option."
+        ls.Range("E3").Value = "After changing SHELF options, run Inv_Setup again to refresh the location colors."
+        ls.Range("E1:E3").Font.Italic = True
+        ls.Tab.Color = RGB(0, 176, 80)
+    End If
+    SetListName "INV_DescList", 1
+    SetListName "INV_ShelfList", 2
+    SetListName "INV_CondList", 3
+End Sub
+
+Private Sub FillCol(ls As Worksheet, ByVal col As Long, ByVal items As Variant)
+    Dim i As Long
+    For i = 0 To UBound(items)
+        ls.Cells(i + 2, col).Value = items(i)
+    Next i
+End Sub
+
+Private Sub SetListName(ByVal nm As String, ByVal col As Long)
+    Dim L As String
+    L = ColL(col)
+    On Error Resume Next
+    ThisWorkbook.Names(nm).Delete
+    On Error GoTo 0
+    ThisWorkbook.Names.Add Name:=nm, RefersTo:="=OFFSET('" & LISTS_SHEET & "'!$" & L & "$2,0,0,MAX(1,COUNTA('" & _
+        LISTS_SHEET & "'!$" & L & ":$" & L & ")-1),1)"
+End Sub
+
+Private Sub AddToList(ByVal col As Long, ByVal item As String)
+    Dim ls As Worksheet, lastR As Long
+    Set ls = SheetByName(LISTS_SHEET)
+    If ls Is Nothing Then Exit Sub
+    If Not IsError(Application.Match(item, ls.Columns(col), 0)) Then Exit Sub
+    lastR = ls.Cells(ls.Rows.Count, col).End(xlUp).Row
+    If UCase$(CellText(ls.Cells(lastR, col).Value)) = CUSTOM_ITEM Then
+        ls.Cells(lastR, col).Insert Shift:=xlDown
+        ls.Cells(lastR, col).Value = item
+    Else
+        ls.Cells(lastR + 1, col).Value = item
+    End If
+End Sub
+
+Private Sub ApplyDropdowns(ws As Worksheet)
+    With ColRange(ws, cDesc).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertInformation, Operator:=xlBetween, _
+             Formula1:="=INV_DescList"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .ShowInput = False
+        .ShowError = False
+    End With
+    With ColRange(ws, cShelf).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertWarning, Operator:=xlBetween, _
+             Formula1:="=INV_ShelfList"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .ShowInput = False
+        .ShowError = True
+        .ErrorTitle = "Shelf location"
+        .ErrorMessage = "That isn't one of the standard locations." & vbLf & _
+                        "Yes = use it anyway     No = pick from the list" & vbLf & _
+                        "(Add new locations on the Lists sheet.)"
+    End With
+    If cCond > 0 Then
+        With ColRange(ws, cCond).Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertInformation, Operator:=xlBetween, _
+                 Formula1:="=INV_CondList"
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowInput = False
+            .ShowError = False
+        End With
+    End If
+End Sub
+
+Private Sub ApplyHighlighting(ws As Worksheet)
+    Dim fr As String, P As String, F As String, G As String, H As String, D As String
+    Dim rOH As Range, rPart As Range, rShelf As Range, ls As Worksheet
+    Dim palette As Variant, i As Long, lastL As Long, item As String
+
+    fr = CStr(FIRST_DATA_ROW)
+    P = "$" & ColL(cPart)
+    F = "$" & ColL(cOnHand)
+    D = "$" & ColL(cShelf)
+    Set rOH = ColRange(ws, cOnHand)
+    Set rPart = ColRange(ws, cPart)
+    Set rShelf = ColRange(ws, cShelf)
+
+    rOH.FormatConditions.Delete
+    rPart.FormatConditions.Delete
+    rShelf.FormatConditions.Delete
+    If cCond > 0 Then ColRange(ws, cCond).FormatConditions.Delete
+
+    ws.Cells(FIRST_DATA_ROW, 1).Select
+
+    If cCond > 0 Then
+        H = "$" & ColL(cCond)
+        AddRule Union(rPart, ColRange(ws, cCond)), "=ISNUMBER(SEARCH(""HOLD""," & H & fr & "))", _
+                RGB(197, 90, 17), RGB(255, 255, 255), True
+    End If
+    AddRule rOH, "=AND(" & P & fr & "<>"""",IFERROR(--" & F & fr & ",0)<=0)", _
+            RGB(255, 0, 0), RGB(255, 255, 255), True
+    If cMin > 0 Then
+        G = "$" & ColL(cMin)
+        AddRule rOH, "=AND(" & P & fr & "<>"""",IFERROR(--" & G & fr & ",0)>0,IFERROR(--" & F & fr & _
+                ",0)<=IFERROR(--" & G & fr & ",0))", RGB(255, 192, 0), RGB(0, 0, 0), True
+    End If
+    AddRule rPart, "=AND(" & P & fr & "<>"""",COUNTIF(" & P & "$" & fr & ":" & P & "$" & MAX_ROW & "," & _
+            P & fr & ")>1)", RGB(255, 199, 206), RGB(156, 0, 6), False
+
+    palette = Array(RGB(198, 239, 206), RGB(255, 255, 0), RGB(248, 203, 173), RGB(189, 215, 238), _
+                    RGB(225, 204, 240), RGB(217, 217, 217), RGB(204, 236, 255), RGB(237, 226, 200))
+    Set ls = SheetByName(LISTS_SHEET)
+    If Not ls Is Nothing Then
+        lastL = ls.Cells(ls.Rows.Count, 2).End(xlUp).Row
+        For i = 2 To lastL
+            item = Trim$(CellText(ls.Cells(i, 2).Value))
+            If item <> "" And (i - 2) <= UBound(palette) Then
+                AddRule rShelf, "=TRIM(" & D & fr & ")=""" & Replace(item, """", """""") & """", _
+                        CLng(palette(i - 2)), -1, True
+            End If
+        Next i
+    End If
+End Sub
+
+Private Sub AddRule(rng As Range, ByVal f As String, ByVal fillColor As Long, ByVal fontColor As Long, _
+                    ByVal stopIfTrue As Boolean)
+    Dim fc As Object
+    Set fc = rng.FormatConditions.Add(Type:=xlExpression, Formula1:=f)
+    fc.SetLastPriority
+    fc.Interior.Color = fillColor
+    If fontColor >= 0 Then fc.Font.Color = fontColor
+    fc.StopIfTrue = stopIfTrue
+End Sub
+
+Private Sub BuildButtons(ws As Worksheet)
+    Dim i As Long, shp As Shape, specs As Variant
+    Dim x0 As Double, y0 As Double, totalW As Double, bw As Double, bh As Double
+    Const GAP As Double = 4
+
+    For i = ws.Shapes.Count To 1 Step -1
+        If ws.Shapes(i).Name Like BTN_PREFIX & "*" Then ws.Shapes(i).Delete
+    Next i
+
+    specs = Array( _
+        Array("Inv_AddItem", "+ ADD ITEM", RGB(0, 150, 70)), _
+        Array("Inv_Find", "FIND", RGB(47, 84, 150)), _
+        Array("Inv_Pull", "PULL / USE", RGB(192, 0, 0)), _
+        Array("Inv_Receive", "RECEIVE", RGB(0, 112, 192)), _
+        Array("Inv_MergeDuplicates", "MERGE DUPES", RGB(112, 48, 160)), _
+        Array("Inv_Sort", "SORT", RGB(89, 89, 89)), _
+        Array("Inv_LowStockReport", "LOW STOCK", RGB(237, 125, 49)), _
+        Array("Inv_ShowAll", "SHOW ALL", RGB(89, 89, 89)))
+
+    x0 = ws.Range(BTN_ANCHOR_COL & "1").Left + GAP
+    y0 = ws.Rows(1).Top + 2
+    totalW = ws.Range(BTN_ANCHOR_COL & "1").Resize(1, 5).Width
+    bw = (totalW - 5 * GAP) / 4
+    If bw < 70 Then bw = 70
+    bh = (ws.Rows(1).Height + ws.Rows(2).Height - 3 * GAP) / 2
+    If bh > 30 Then bh = 30
+    If bh < 18 Then bh = 18
+
+    For i = 0 To UBound(specs)
+        Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, _
+                    x0 + (i Mod 4) * (bw + GAP), y0 + (i \ 4) * (bh + GAP), bw, bh)
+        With shp
+            .Name = BTN_PREFIX & specs(i)(0)
+            .OnAction = specs(i)(0)
+            .Placement = xlFreeFloating
+            .Fill.ForeColor.RGB = specs(i)(2)
+            .Line.Visible = msoFalse
+            With .TextFrame2
+                .VerticalAnchor = msoAnchorMiddle
+                .WordWrap = msoTrue
+                .MarginLeft = 2
+                .MarginRight = 2
+                .MarginTop = 1
+                .MarginBottom = 1
+                With .TextRange
+                    .Text = specs(i)(1)
+                    .Font.Size = 9
+                    .Font.Bold = msoTrue
+                    .Font.Fill.ForeColor.RGB = RGB(255, 255, 255)
+                    .ParagraphFormat.Alignment = msoAlignCenter
+                End With
+            End With
+        End With
+    Next i
+End Sub
+
+Private Sub MigrateHoldFills(ws As Worksheet)
+    Dim f As Range, sw As Range, holdColor As Long, r As Long, c As Long, lastR As Long
+    Dim rowsFound As Collection, item As Variant
+
+    If cCond = 0 Then Exit Sub
+    Set f = ws.Range(ws.Cells(1, 1), ws.Cells(FIRST_DATA_ROW - 1, cLastCol)).Find( _
+                What:="HOLD", LookIn:=xlValues, LookAt:=xlPart, MatchCase:=False)
+    If f Is Nothing Then Exit Sub
+    If f.Column = 1 Then Exit Sub
+    Set sw = f.Offset(0, -1).MergeArea.Cells(1, 1)
+    If sw.Interior.ColorIndex = xlColorIndexNone Then Exit Sub
+    holdColor = sw.Interior.Color
+
+    Set rowsFound = New Collection
+    lastR = LastDataRow(ws)
+    For r = FIRST_DATA_ROW To lastR
+        If Len(Trim$(CellText(ws.Cells(r, cCond).Value))) = 0 And Len(CellText(ws.Cells(r, cPart).Value)) > 0 Then
+            For c = 1 To cLastCol
+                If ws.Cells(r, c).Interior.ColorIndex <> xlColorIndexNone Then
+                    If ws.Cells(r, c).Interior.Color = holdColor Then
+                        rowsFound.Add r
+                        Exit For
+                    End If
+                End If
+            Next c
+        End If
+    Next r
+    If rowsFound.Count = 0 Then Exit Sub
+
+    If MsgBox(rowsFound.Count & " row(s) are colored with the brown HOLD DO NOT USE legend color." & vbLf & vbLf & _
+              "Set their CONDITION to """ & HOLD_TEXT & """ so they're flagged automatically " & _
+              "(and PULL warns before using them)?", vbYesNo + vbQuestion, APP_TITLE) = vbNo Then Exit Sub
+    For Each item In rowsFound
+        ws.Cells(item, cCond).Value = HOLD_TEXT
+    Next item
+End Sub
+
+
+'==============================================================================
+'                           DESCRIPTION FORMATTING
+'==============================================================================
+
+Private Sub WriteDescription(ByVal c As Range, ByVal mainTxt As String, ByVal subTxt As String)
+    Dim pre As String
+    If Left$(mainTxt, 1) Like "[=+@-]" Then pre = "'"
+    If Len(subTxt) > 0 Then
+        c.Value = pre & mainTxt & vbLf & subTxt
+    Else
+        c.Value = pre & mainTxt
+    End If
+    c.WrapText = True
+    FormatDescCell c
+    c.EntireRow.AutoFit
+    gPrevDescAddr = c.Address
+    gPrevDescVal = CellText(c.Value)
+End Sub
+
+Private Sub FormatDescCell(ByVal c As Range)
+    Dim v As String, p As Long
+    If c.HasFormula Then Exit Sub
+    v = CellText(c.Value)
+    With c.Font
+        .Size = MAIN_FONT_SIZE
+        .Italic = False
+        .ColorIndex = xlColorIndexAutomatic
+    End With
+    p = InStr(v, vbLf)
+    If p > 0 And Len(v) > p Then
+        c.WrapText = True
+        With c.Characters(p + 1, Len(v) - p).Font
+            .Size = SUB_FONT_SIZE
+            .Italic = True
+            .Color = RGB(89, 89, 89)
+        End With
+    End If
+End Sub
+
+Private Sub RestorePrevDesc(ByVal c As Range)
+    If gPrevDescAddr = c.Address And Len(gPrevDescVal) > 0 Then
+        c.Value = gPrevDescVal
+        FormatDescCell c
+    Else
+        c.ClearContents
+    End If
+End Sub
+
+Private Function MainPart(ByVal s As String) As String
+    Dim p As Long
+    p = InStr(s, vbLf)
+    If p > 0 Then MainPart = Left$(s, p - 1) Else MainPart = s
+End Function
+
+Private Function SubPart(ByVal s As String) As String
+    Dim p As Long
+    p = InStr(s, vbLf)
+    If p > 0 Then SubPart = Mid$(s, p + 1)
+End Function
+
+
+'==============================================================================
+'                                  HELPERS
+'==============================================================================
+
+Private Function GetInv() As Worksheet
+    Dim ws As Worksheet
+    Set ws = SheetByName(SHEET_NAME)
+    If ws Is Nothing Then
+        MsgBox "Couldn't find a sheet named """ & SHEET_NAME & """." & vbLf & _
+               "Rename the inventory tab, or change SHEET_NAME at the top of the module.", _
+               vbCritical, APP_TITLE
+        Exit Function
+    End If
+    If Not LoadCols(ws, True) Then Exit Function
+    Set GetInv = ws
+End Function
+
+Private Function LoadCols(ws As Worksheet, Optional ByVal showMsg As Boolean = False) As Boolean
+    Dim c As Long, lastC As Long, h As String, missing As String
+
+    cScan = 0: cPart = 0: cDesc = 0: cShelf = 0: cBin = 0: cOnHand = 0: cMin = 0: cCond = 0
+    cOnOrder = 0: cOrderNo = 0: cProgram = 0: cCharge = 0: cLastPurch = 0: cTNum = 0
+    cBarPrint = 0: cSku = 0: cMfg = 0: cLastCol = 0
+
+    lastC = ws.Cells(HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+    c = ws.Cells(HEADER_ROW + 1, ws.Columns.Count).End(xlToLeft).Column
+    If c > lastC Then lastC = c
+    With ws.Cells(HEADER_ROW, lastC).MergeArea
+        If .Column + .Columns.Count - 1 > lastC Then lastC = .Column + .Columns.Count - 1
+    End With
+
+    For c = 1 To lastC
+        h = HeaderText(ws, c)
+        If Len(h) > 0 Then
+            Select Case True
+                Case h Like "BARCODE SCAN*": If cScan = 0 Then cScan = c
+                Case h Like "BARCODE PRINT*": If cBarPrint = 0 Then cBarPrint = c
+                Case h Like "PART*": If cPart = 0 Then cPart = c
+                Case h Like "DESC*": If cDesc = 0 Then cDesc = c
+                Case h Like "SHELF*": If cShelf = 0 Then cShelf = c
+                Case h Like "BIN*": If cBin = 0 Then cBin = c
+                Case h Like "ON HAND*": If cOnHand = 0 Then cOnHand = c
+                Case h Like "MIN*": If cMin = 0 Then cMin = c
+                Case h Like "CONDITION*": If cCond = 0 Then cCond = c
+                Case h Like "ON ORDER*": If cOnOrder = 0 Then cOnOrder = c
+                Case h Like "ORDER*": If cOrderNo = 0 Then cOrderNo = c
+                Case h Like "PROGRAM*": If cProgram = 0 Then cProgram = c
+                Case h Like "CHARGE*": If cCharge = 0 Then cCharge = c
+                Case h Like "LAST PURCH*": If cLastPurch = 0 Then cLastPurch = c
+                Case h Like "T NUM*", h Like "T-NUM*": If cTNum = 0 Then cTNum = c
+                Case h Like "SKU*": If cSku = 0 Then cSku = c
+                Case h Like "MFG*", h Like "MANUFACT*": If cMfg = 0 Then cMfg = c
+            End Select
+        End If
+    Next c
+    cLastCol = lastC
+
+    If cPart = 0 Then missing = missing & "PART NUMBER, "
+    If cDesc = 0 Then missing = missing & "DESCRIPTION, "
+    If cShelf = 0 Then missing = missing & "SHELF, "
+    If cOnHand = 0 Then missing = missing & "ON HAND QTY, "
+    If Len(missing) > 0 Then
+        If showMsg Then
+            MsgBox "Couldn't find these column titles in rows " & HEADER_ROW & "-" & (HEADER_ROW + 1) & ":" & _
+                   vbLf & "   " & Left$(missing, Len(missing) - 2) & vbLf & vbLf & _
+                   "Check HEADER_ROW / FIRST_DATA_ROW at the top of the module.", _
+                   vbCritical, APP_TITLE
+        End If
+        Exit Function
+    End If
+    LoadCols = True
+End Function
+
+Private Function HeaderText(ws As Worksheet, ByVal c As Long) As String
+    Dim a As String, b As String, s As String, m As Range
+    Set m = ws.Cells(HEADER_ROW, c).MergeArea
+    If m.Column = c Then a = CellText(m.Cells(1, 1).Value)
+    Set m = ws.Cells(HEADER_ROW + 1, c).MergeArea
+    If m.Row = HEADER_ROW + 1 And m.Column = c Then b = CellText(m.Cells(1, 1).Value)
+    s = UCase$(a & " " & b)
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    s = Replace(s, Chr$(160), " ")
+    Do While InStr(s, "  ") > 0
+        s = Replace(s, "  ", " ")
+    Loop
+    HeaderText = Trim$(s)
+End Function
+
+Private Function LastDataRow(ws As Worksheet) As Long
+    Dim f As Range
+    Set f = ws.Columns(cPart).Find(What:="*", LookIn:=xlFormulas, LookAt:=xlPart, _
+                                   SearchOrder:=xlByRows, SearchDirection:=xlPrevious)
+    If f Is Nothing Then
+        LastDataRow = FIRST_DATA_ROW - 1
+    ElseIf f.Row < FIRST_DATA_ROW Then
+        LastDataRow = FIRST_DATA_ROW - 1
+    Else
+        LastDataRow = f.Row
+    End If
+End Function
+
+Private Function FindPartRow(ws As Worksheet, ByVal part As String, ByVal excludeRow As Long) As Long
+    Dim k As String, lastR As Long, v As Variant, i As Long
+    k = NormKey(part)
+    If k = "" Then Exit Function
+    lastR = LastDataRow(ws)
+    If lastR < FIRST_DATA_ROW Then Exit Function
+    v = ColValues(ws, cPart, lastR)
+    For i = 1 To UBound(v, 1)
+        If (i + FIRST_DATA_ROW - 1) <> excludeRow Then
+            If NormKey(v(i, 1)) = k Then
+                FindPartRow = i + FIRST_DATA_ROW - 1
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Private Function ColValues(ws As Worksheet, ByVal col As Long, ByVal lastR As Long) As Variant
+    Dim v As Variant
+    If lastR <= FIRST_DATA_ROW Then
+        ReDim v(1 To 1, 1 To 1)
+        v(1, 1) = ws.Cells(FIRST_DATA_ROW, col).Value
+    Else
+        v = ws.Range(ws.Cells(FIRST_DATA_ROW, col), ws.Cells(lastR, col)).Value
+    End If
+    ColValues = v
+End Function
+
+Private Function ColValuesOpt(ws As Worksheet, ByVal col As Long, ByVal lastR As Long) As Variant
+    If col > 0 Then ColValuesOpt = ColValues(ws, col, lastR) Else ColValuesOpt = Empty
+End Function
+
+Private Function ArrVal(v As Variant, ByVal i As Long) As Variant
+    If IsArray(v) Then ArrVal = v(i, 1) Else ArrVal = Empty
+End Function
+
+Private Function ColRange(ws As Worksheet, ByVal col As Long) As Range
+    Set ColRange = ws.Range(ws.Cells(FIRST_DATA_ROW, col), ws.Cells(MAX_ROW, col))
+End Function
+
+Private Function ColL(ByVal c As Long) As String
+    Dim n As Long, s As String
+    n = c
+    Do While n > 0
+        s = Chr$(65 + ((n - 1) Mod 26)) & s
+        n = (n - 1) \ 26
+    Loop
+    ColL = s
+End Function
+
+Private Sub ShowAllRows(ws As Worksheet)
+    Dim lastR As Long
+    On Error Resume Next
+    If ws.FilterMode Then ws.ShowAllData
+    On Error GoTo 0
+    lastR = LastDataRow(ws)
+    If lastR >= FIRST_DATA_ROW Then ws.Rows(FIRST_DATA_ROW & ":" & lastR).Hidden = False
+End Sub
+
+Private Sub SelectCell(ws As Worksheet, ByVal c As Range)
+    ws.Activate
+    c.Select
+    EnsureVisible c
+    If c.Column = cDesc Then
+        gPrevDescAddr = c.Address
+        gPrevDescVal = CellText(c.Value)
+    End If
+End Sub
+
+Private Sub SelectRow(ws As Worksheet, ByVal r As Long, ByVal focusCol As Long)
+    ws.Activate
+    ws.Range(ws.Cells(r, 1), ws.Cells(r, cLastCol)).Select
+    ws.Cells(r, focusCol).Activate
+    EnsureVisible ws.Cells(r, focusCol)
+End Sub
+
+Private Sub EnsureVisible(ByVal c As Range)
+    On Error Resume Next
+    If Intersect(ActiveWindow.VisibleRange, c) Is Nothing Then
+        ActiveWindow.ScrollRow = MaxL(FIRST_DATA_ROW, c.Row - 8)
+        If Intersect(ActiveWindow.VisibleRange, c) Is Nothing Then ActiveWindow.ScrollColumn = MaxL(1, c.Column - 1)
+    End If
+End Sub
+
+Private Function RowEmptyExcept(ws As Worksheet, ByVal r As Long, ByVal exceptCol As Long) As Boolean
+    Dim c As Long, cel As Range
+    For c = 1 To cLastCol
+        If c <> exceptCol Then
+            Set cel = ws.Cells(r, c)
+            If Not cel.HasFormula Then
+                If Len(CellText(cel.Value)) > 0 Then Exit Function
+            End If
+        End If
+    Next c
+    RowEmptyExcept = True
+End Function
+
+Private Sub ClearRowConstants(ws As Worksheet, ByVal r As Long)
+    Dim c As Long
+    For c = 1 To cLastCol
+        If Not ws.Cells(r, c).HasFormula Then ws.Cells(r, c).ClearContents
+    Next c
+End Sub
+
+Private Sub SetIfBlank(ws As Worksheet, ByVal r As Long, ByVal col As Long, ByVal v As Variant)
+    If col = 0 Then Exit Sub
+    If Len(CellText(ws.Cells(r, col).Value)) = 0 Then ws.Cells(r, col).Value = v
+End Sub
+
+Private Function IsOnHold(ws As Worksheet, ByVal r As Long) As Boolean
+    If cCond > 0 Then IsOnHold = (InStr(1, UCase$(CellText(ws.Cells(r, cCond).Value)), "HOLD") > 0)
+End Function
+
+Private Function IsTextCol(ByVal c As Long) As Boolean
+    IsTextCol = (c = cShelf Or c = cBin Or c = cProgram Or c = cCharge Or c = cTNum Or _
+                 c = cSku Or c = cMfg Or c = cCond Or c = cScan Or c = cBarPrint)
+End Function
+
+Private Function LocText(ws As Worksheet, ByVal r As Long) As String
+    Dim s As String, b As String
+    s = Trim$(Replace(CellText(ws.Cells(r, cShelf).Value), vbLf, " "))
+    If s = "" Then s = "(no shelf)"
+    If cBin > 0 Then
+        b = Trim$(CellText(ws.Cells(r, cBin).Value))
+        If b <> "" Then s = s & ", Bin " & b
+    End If
+    LocText = s
+End Function
+
+Private Function ItemSummary(ws As Worksheet, ByVal r As Long) As String
+    Dim s As String, d As String, oo As Double
+    s = CellText(ws.Cells(r, cPart).Value)
+    d = MainPart(CellText(ws.Cells(r, cDesc).Value))
+    If d <> "" Then s = s & "   -   " & d
+    s = s & vbLf & "Location: " & LocText(ws, r)
+    s = s & vbLf & "On hand: " & NumVal(ws.Cells(r, cOnHand).Value)
+    If cOnOrder > 0 Then
+        oo = NumVal(ws.Cells(r, cOnOrder).Value)
+        If oo > 0 Then s = s & "      On order: " & oo
+    End If
+    ItemSummary = s
+End Function
+
+Private Function AskQty(ByVal prompt As String, ByVal title As String, ByVal defaultQty As Double) As Double
+    Dim r As Variant
+    Do
+        r = Application.InputBox(prompt, title, defaultQty, Type:=1)
+        If VarType(r) = vbBoolean Then
+            AskQty = -1
+            Exit Function
+        End If
+        If r >= 0 Then
+            AskQty = r
+            Exit Function
+        End If
+        MsgBox "Enter a quantity of 0 or more.", vbExclamation, APP_TITLE
+    Loop
+End Function
+
+Private Function AskText(ByVal prompt As String, ByVal title As String, ByVal def As String, _
+                         ByRef cancelled As Boolean) As String
+    Dim r As Variant
+    r = Application.InputBox(prompt, title, def, Type:=2)
+    If VarType(r) = vbBoolean Then
+        cancelled = True
+        AskText = ""
+    Else
+        cancelled = False
+        AskText = CleanScan(CStr(r))
+    End If
+End Function
+
+Private Sub WriteLog(ByVal action As String, ByVal part As String, ByVal qtyChange As Variant, _
+                     ByVal newQty As Variant, Optional ByVal note As String = "")
+    Dim lg As Worksheet, r As Long
+    Set lg = GetLogSheet()
+    r = lg.Cells(lg.Rows.Count, 1).End(xlUp).Row + 1
+    lg.Cells(r, 1).Value = Now
+    lg.Cells(r, 2).Value = Environ$("USERNAME")
+    lg.Cells(r, 3).Value = action
+    lg.Cells(r, 4).NumberFormat = "@"
+    lg.Cells(r, 4).Value = part
+    lg.Cells(r, 5).Value = qtyChange
+    lg.Cells(r, 6).Value = newQty
+    lg.Cells(r, 7).Value = note
+End Sub
+
+Private Function GetLogSheet() As Worksheet
+    Dim lg As Worksheet
+    Set lg = SheetByName(LOG_SHEET)
+    If lg Is Nothing Then
+        Set lg = GetOrCreateSheet(LOG_SHEET)
+        lg.Range("A1:G1").Value = Array("DATE / TIME", "USER", "ACTION", "PART NUMBER", "QTY CHANGE", _
+                                        "NEW ON HAND", "NOTES")
+        With lg.Range("A1:G1")
+            .Font.Bold = True
+            .Font.Color = RGB(255, 255, 255)
+            .Interior.Color = RGB(31, 56, 100)
+        End With
+        lg.Columns("A").NumberFormat = "mm/dd/yyyy h:mm AM/PM"
+        lg.Columns("A").ColumnWidth = 20
+        lg.Columns("B").ColumnWidth = 14
+        lg.Columns("C").ColumnWidth = 12
+        lg.Columns("D").ColumnWidth = 22
+        lg.Columns("E:F").ColumnWidth = 13
+        lg.Columns("G").ColumnWidth = 80
+        lg.Tab.Color = RGB(31, 56, 100)
+    End If
+    Set GetLogSheet = lg
+End Function
+
+Private Function GetOrCreateSheet(ByVal nm As String) As Worksheet
+    Dim sh As Worksheet, prev As Object
+    Set sh = SheetByName(nm)
+    If sh Is Nothing Then
+        Set prev = ActiveSheet
+        Set sh = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        sh.Name = nm
+        If Not prev Is Nothing Then prev.Activate
+    End If
+    Set GetOrCreateSheet = sh
+End Function
+
+Private Function SheetByName(ByVal nm As String) As Worksheet
+    On Error Resume Next
+    Set SheetByName = ThisWorkbook.Worksheets(nm)
+End Function
+
+Private Sub RestoreAutoComplete()
+    If gACStored Then
+        Application.EnableAutoComplete = gAutoCompleteWas
+        gACStored = False
+    End If
+End Sub
+
+Private Function CellText(ByVal v As Variant) As String
+    If IsArray(v) Then Exit Function
+    If IsError(v) Then Exit Function
+    If IsEmpty(v) Or IsNull(v) Then Exit Function
+    CellText = CStr(v)
+End Function
+
+Private Function NormKey(ByVal v As Variant) As String
+    Dim s As String
+    s = CellText(v)
+    s = Replace(s, vbCr, "")
+    s = Replace(s, vbLf, "")
+    s = Replace(s, vbTab, "")
+    s = Replace(s, Chr$(160), " ")
+    NormKey = UCase$(Trim$(s))
+End Function
+
+Private Function CleanScan(ByVal s As String) As String
+    s = Replace(s, vbCr, "")
+    s = Replace(s, vbLf, "")
+    s = Replace(s, vbTab, "")
+    s = Replace(s, Chr$(160), " ")
+    CleanScan = Trim$(s)
+End Function
+
+Private Function NumVal(ByVal v As Variant) As Double
+    If IsError(v) Then Exit Function
+    If IsNumeric(v) Then NumVal = CDbl(v)
+End Function
+
+Private Function ToNum(ByVal v As Variant, ByRef ok As Boolean) As Double
+    ok = False
+    If IsError(v) Or IsEmpty(v) Then Exit Function
+    If VarType(v) = vbDate Then
+        ToNum = CDbl(v)
+        ok = True
+    ElseIf IsNumeric(v) Then
+        ToNum = CDbl(v)
+        ok = True
+    End If
+End Function
+
+Private Function JoinDistinct(ByVal sa As String, ByVal sb As String) As String
+    If InStr(1, " / " & UCase$(sa) & " / ", " / " & UCase$(sb) & " / ", vbBinaryCompare) > 0 Then
+        JoinDistinct = sa
+    Else
+        JoinDistinct = sa & " / " & sb
+    End If
+End Function
+
+Private Sub AddNote(ByRef notes As String, ByVal txt As String)
+    If InStr(1, notes, txt, vbTextCompare) = 0 Then notes = notes & txt & "; "
+End Sub
+
+Private Function MaxL(ByVal a As Long, ByVal b As Long) As Long
+    If a > b Then MaxL = a Else MaxL = b
+End Function
+
+Private Sub ShowErr()
+    MsgBox "Inventory tools hit a problem:" & vbLf & vbLf & Err.Description & vbLf & vbLf & _
+           "If buttons/dropdowns stop reacting, run Inv_Reset (Alt+F8).", vbExclamation, APP_TITLE
+End Sub
