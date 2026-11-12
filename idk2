@@ -1,0 +1,11 @@
+Private Sub Worksheet_Change(ByVal Target As Range)
+    Inv_OnChange Target
+End Sub
+
+Private Sub Worksheet_SelectionChange(ByVal Target As Range)
+    Inv_OnSelect Target
+End Sub
+
+Private Sub Worksheet_BeforeDoubleClick(ByVal Target As Range, Cancel As Boolean)
+    Inv_OnDoubleClick Target, Cancel
+End Sub
